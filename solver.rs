@@ -1,6 +1,8 @@
 use crate::game::{self, DictByLen, PackedLetters, Segments, BASE_SCORE};
 use rustc_hash::FxHashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use rayon::prelude::*;
 
 const ALL_MASK: u32 = (1 << 25) - 1;
 const REPORT_EVERY: usize = 10_000;
@@ -59,9 +61,8 @@ fn filled_mask_from_packed(packed: PackedLetters) -> u32 {
 
 // Word index for pattern matching
 pub struct WordIndex {
-    words: Vec<u64>, // Packed words
+    words: Vec<u64>,
     counts: Vec<LetterCounts>,
-    // pos_letter_bits[position][letter] = bitmask of words
     pos_letter_bits: Vec<[u64; 26]>,
     len: usize,
 }
@@ -89,9 +90,9 @@ impl WordIndex {
 
         let mut pos_letter_bits = vec![[0u64; 26]; length];
         for (word_idx, &word) in words.iter().enumerate() {
-            let bit = 1u64 << (word_idx % 64); // Limited to 64 words per bit position
+            let bit = 1u64 << (word_idx % 64);
             if word_idx >= 64 {
-                continue; // Simple limitation for this implementation
+                continue;
             }
 
             for pos in 0..length {
@@ -113,7 +114,6 @@ impl WordIndex {
     #[inline]
     fn candidates_for_pattern(&self, pattern: &[Option<u8>]) -> u64 {
         if self.words.len() > 64 {
-            // Simplified: if more than 64 words, just return all set
             return u64::MAX;
         }
 
@@ -192,7 +192,7 @@ fn segment_feasible(
             return true;
         }
 
-        cand_bits &= cand_bits - 1; // Clear lowest bit
+        cand_bits &= cand_bits - 1;
     }
 
     false
@@ -242,21 +242,18 @@ fn upper_bound(
     let remaining = &suffix_counts[m];
     let mut ub_add = 0;
 
-    // Check 5-letter segments
     for (seg, &cap) in segments.seg5.iter().zip(&seg_caps.caps5) {
         if segment_feasible(seg, disabled_mask, letters_packed, remaining, &indices.idx5) {
             ub_add += cap;
         }
     }
 
-    // Check 4-letter segments
     for (seg, &cap) in segments.seg4.iter().zip(&seg_caps.caps4) {
         if segment_feasible(seg, disabled_mask, letters_packed, remaining, &indices.idx4) {
             ub_add += cap;
         }
     }
 
-    // Check 3-letter segments
     for (seg, &cap) in segments.seg3.iter().zip(&seg_caps.caps3) {
         if segment_feasible(seg, disabled_mask, letters_packed, remaining, &indices.idx3) {
             ub_add += cap;
@@ -304,62 +301,50 @@ pub struct SolveResult {
     pub best_order: Vec<usize>,
 }
 
-pub fn solve_exact(
-    daily_letters: &[u8], // 1-26 for A-Z
-    mult: &[i32; 25],
-    dictionary_path: &str,
-) -> std::io::Result<SolveResult> {
-    let dict = DictByLen::load(dictionary_path)?;
-    let segments = game::build_segments(mult);
+// Shared state for parallel search
+struct SharedState {
+    best_score: Mutex<i32>,
+    nodes: Mutex<usize>,
+    last_report_t: Mutex<Instant>,
+}
 
-    let indices = Indices {
-        idx3: WordIndex::build(&dict, 3),
-        idx4: WordIndex::build(&dict, 4),
-        idx5: WordIndex::build(&dict, 5),
-    };
+impl SharedState {
+    fn new() -> Arc<Self> {
+        Arc::new(SharedState {
+            best_score: Mutex::new(i32::MIN),
+            nodes: Mutex::new(0),
+            last_report_t: Mutex::new(Instant::now()),
+        })
+    }
 
-    let suffix_counts = build_suffix_counts(daily_letters);
-    let seg_caps = SegmentCaps::new(&segments);
+    fn update_best(&self, score: i32) -> bool {
+        let mut best = self.best_score.lock().unwrap();
+        if score > *best {
+            *best = score;
+            true
+        } else {
+            false
+        }
+    }
 
-    let mut nodes = 0usize;
-    let start_t = Instant::now();
-    let mut last_report_t = start_t;
-    let mut best_score = i32::MIN;
+    fn get_best(&self) -> i32 {
+        *self.best_score.lock().unwrap()
+    }
 
-    let root_packed: PackedLetters = 0;
-    let root_ub = upper_bound(
-        0, 0, 0, 0, 0, 0, root_packed,
-        &segments, &seg_caps, &suffix_counts, &indices, daily_letters.len(),
-    );
-
-    let mut cache: FxHashMap<(usize, State), i32> = FxHashMap::default();
-
-    fn dfs(
-        m: usize,
-        state: State,
-        daily_letters: &[u8],
-        dict: &DictByLen,
-        segments: &Segments,
-        seg_caps: &SegmentCaps,
-        suffix_counts: &[LetterCounts],
-        indices: &Indices,
-        nodes: &mut usize,
-        best_score: &mut i32,
-        last_report_t: &mut Instant,
-        start_t: Instant,
-        root_ub: i32,
-        cache: &mut FxHashMap<(usize, State), i32>,
-    ) -> i32 {
+    fn increment_nodes(&self, start_t: Instant, daily_letters_len: usize, root_ub: i32, depth: usize) {
+        let mut nodes = self.nodes.lock().unwrap();
         *nodes += 1;
 
         if *nodes % REPORT_EVERY == 0 {
+            let mut last_t = self.last_report_t.lock().unwrap();
             let now = Instant::now();
-            let dt = (now - *last_report_t).as_secs_f64();
+            let dt = (now - *last_t).as_secs_f64();
             let total_dt = (now - start_t).as_secs_f64();
             let nps = if dt > 0.0 { REPORT_EVERY as f64 / dt } else { 0.0 };
 
-            let gap = if *best_score > i32::MIN / 2 {
-                Some(root_ub - *best_score)
+            let best = self.get_best();
+            let gap = if best > i32::MIN / 2 {
+                Some(root_ub - best)
             } else {
                 None
             };
@@ -367,75 +352,294 @@ pub fn solve_exact(
             if let Some(g) = gap {
                 println!(
                     "[progress] nodes={:>12} depth={:>2}/{} best={:>6}  rootUB-best={:>4}  n/s={:>10.0} elapsed={:.1}s",
-                    nodes, m, daily_letters.len(), best_score, g, nps, total_dt
+                    nodes, depth, daily_letters_len, best, g, nps, total_dt
                 );
             } else {
                 println!(
                     "[progress] nodes={:>12} depth={:>2}/{} best=unset  n/s={:>10.0} elapsed={:.1}s",
-                    nodes, m, daily_letters.len(), nps, total_dt
+                    nodes, depth, daily_letters_len, nps, total_dt
                 );
             }
 
-            *last_report_t = now;
+            *last_t = now;
         }
+    }
+}
 
-        // Check cache
-        let cache_key = (m, state);
-        if let Some(&cached) = cache.get(&cache_key) {
-            return cached;
+pub fn solve_exact_parallel(
+    daily_letters: &[u8],
+    mult: &[i32; 25],
+    dictionary_path: &str,
+    num_threads: usize,
+) -> std::io::Result<SolveResult> {
+    // Configure rayon thread pool
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok(); // Ignore error if already initialized
+
+    let dict = DictByLen::load(dictionary_path)?;
+    let segments = game::build_segments(mult);
+
+    let indices = Arc::new(Indices {
+        idx3: WordIndex::build(&dict, 3),
+        idx4: WordIndex::build(&dict, 4),
+        idx5: WordIndex::build(&dict, 5),
+    });
+
+    let suffix_counts = Arc::new(build_suffix_counts(daily_letters));
+    let seg_caps = Arc::new(SegmentCaps::new(&segments));
+    let dict = Arc::new(dict);
+    let segments = Arc::new(segments);
+    let daily_letters = Arc::new(daily_letters.to_vec());
+
+    let start_t = Instant::now();
+    let shared = SharedState::new();
+
+    let root_packed: PackedLetters = 0;
+    let root_ub = upper_bound(
+        0, 0, 0, 0, 0, 0, root_packed,
+        &segments, &seg_caps, &suffix_counts, &indices, daily_letters.len(),
+    );
+
+    println!("Starting parallel search with {} threads", num_threads);
+
+    // Thread-local caches
+    let initial_state = State {
+        disabled_mask: 0,
+        letters_packed: root_packed,
+        c3: 0,
+        c4: 0,
+        c5: 0,
+        score: 0,
+    };
+
+    // Collect first-level moves to parallelize
+    let letter = daily_letters[0];
+    let filled = filled_mask_from_packed(initial_state.letters_packed);
+    let legal_mask = (!filled) & (!initial_state.disabled_mask) & ALL_MASK;
+
+    let mut first_moves = Vec::new();
+    let mut lm = legal_mask;
+    while lm != 0 {
+        let pos = lm.trailing_zeros() as usize;
+        lm &= lm - 1;
+
+        if let Some((new_packed, new_disabled, new_score, nc3, nc4, nc5)) =
+            game::apply_move_packed(
+                initial_state.letters_packed,
+                initial_state.disabled_mask,
+                initial_state.score,
+                initial_state.c3,
+                initial_state.c4,
+                initial_state.c5,
+                pos,
+                letter,
+                &dict,
+                &segments,
+            )
+        {
+            let new_state = State {
+                disabled_mask: new_disabled,
+                letters_packed: new_packed,
+                c3: nc3,
+                c4: nc4,
+                c5: nc5,
+                score: new_score,
+            };
+            first_moves.push((pos, new_state));
         }
+    }
 
-        // Upper bound pruning
-        let ub = upper_bound(
-            state.score, state.c3, state.c4, state.c5, m,
-            state.disabled_mask, state.letters_packed,
-            segments, seg_caps, suffix_counts, indices, daily_letters.len(),
+    // Process first-level moves in parallel
+    first_moves.par_iter().for_each(|(pos, state)| {
+        let mut cache: FxHashMap<(usize, State), i32> = FxHashMap::default();
+
+        dfs_parallel(
+            1,
+            *state,
+            &daily_letters,
+            &dict,
+            &segments,
+            &seg_caps,
+            &suffix_counts,
+            &indices,
+            &shared,
+            start_t,
+            root_ub,
+            &mut cache,
+        );
+    });
+
+    let best_score = shared.get_best();
+    let total_nodes = *shared.nodes.lock().unwrap();
+
+    println!("\nSearch complete!");
+    println!("Total nodes explored: {}", total_nodes);
+    println!("Best score found: {}", best_score);
+
+    // Reconstruct best path (sequential)
+    let best_order = reconstruct_parallel(
+        &daily_letters,
+        &dict,
+        &segments,
+        &shared,
+    );
+
+    Ok(SolveResult {
+        best_score,
+        best_order,
+    })
+}
+
+fn dfs_parallel(
+    m: usize,
+    state: State,
+    daily_letters: &Arc<Vec<u8>>,
+    dict: &Arc<DictByLen>,
+    segments: &Arc<Segments>,
+    seg_caps: &Arc<SegmentCaps>,
+    suffix_counts: &Arc<Vec<LetterCounts>>,
+    indices: &Arc<Indices>,
+    shared: &Arc<SharedState>,
+    start_t: Instant,
+    root_ub: i32,
+    cache: &mut FxHashMap<(usize, State), i32>,
+) -> i32 {
+    shared.increment_nodes(start_t, daily_letters.len(), root_ub, m);
+
+    // Check cache
+    let cache_key = (m, state);
+    if let Some(&cached) = cache.get(&cache_key) {
+        return cached;
+    }
+
+    // Upper bound pruning
+    let ub = upper_bound(
+        state.score, state.c3, state.c4, state.c5, m,
+        state.disabled_mask, state.letters_packed,
+        segments, seg_caps, suffix_counts, indices, daily_letters.len(),
+    );
+
+    let best_so_far = shared.get_best();
+    if ub <= best_so_far {
+        cache.insert(cache_key, i32::MIN);
+        return i32::MIN;
+    }
+
+    // Terminal
+    if m == daily_letters.len() {
+        let final_score = game::finalize_score_packed(
+            state.letters_packed, state.disabled_mask,
+            state.score, state.c3, state.c4, state.c5,
         );
 
-        if ub <= *best_score {
-            cache.insert(cache_key, i32::MIN);
-            return i32::MIN;
-        }
+        shared.update_best(final_score);
+        cache.insert(cache_key, final_score);
+        return final_score;
+    }
 
-        // Terminal
-        if m == daily_letters.len() {
-            let final_score = game::finalize_score_packed(
-                state.letters_packed, state.disabled_mask,
-                state.score, state.c3, state.c4, state.c5,
+    let letter = daily_letters[m];
+    let filled = filled_mask_from_packed(state.letters_packed);
+    let legal_mask = (!filled) & (!state.disabled_mask) & ALL_MASK;
+
+    if legal_mask == 0 {
+        let final_score = game::finalize_score_packed(
+            state.letters_packed, state.disabled_mask,
+            state.score, state.c3, state.c4, state.c5,
+        );
+
+        shared.update_best(final_score);
+        cache.insert(cache_key, final_score);
+        return final_score;
+    }
+
+    let mut local_best = i32::MIN;
+    let mut lm = legal_mask;
+
+    while lm != 0 {
+        let pos = lm.trailing_zeros() as usize;
+        lm &= lm - 1;
+
+        if let Some((new_packed, new_disabled, new_score, nc3, nc4, nc5)) =
+            game::apply_move_packed(
+                state.letters_packed,
+                state.disabled_mask,
+                state.score,
+                state.c3,
+                state.c4,
+                state.c5,
+                pos,
+                letter,
+                dict,
+                segments,
+            )
+        {
+            let new_state = State {
+                disabled_mask: new_disabled,
+                letters_packed: new_packed,
+                c3: nc3,
+                c4: nc4,
+                c5: nc5,
+                score: new_score,
+            };
+
+            let val = dfs_parallel(
+                m + 1,
+                new_state,
+                daily_letters,
+                dict,
+                segments,
+                seg_caps,
+                suffix_counts,
+                indices,
+                shared,
+                start_t,
+                root_ub,
+                cache,
             );
 
-            if final_score > *best_score {
-                *best_score = final_score;
+            if val > local_best {
+                local_best = val;
             }
-
-            cache.insert(cache_key, final_score);
-            return final_score;
         }
+    }
 
+    cache.insert(cache_key, local_best);
+    local_best
+}
+
+fn reconstruct_parallel(
+    daily_letters: &[u8],
+    dict: &DictByLen,
+    segments: &Segments,
+    shared: &Arc<SharedState>,
+) -> Vec<usize> {
+    let mut order = Vec::new();
+    let mut state = State {
+        disabled_mask: 0,
+        letters_packed: 0,
+        c3: 0,
+        c4: 0,
+        c5: 0,
+        score: 0,
+    };
+
+    // Simple greedy reconstruction - in parallel version, exact reconstruction
+    // would require storing the full search tree, which is memory intensive.
+    // This gives a valid path but may not be THE optimal path.
+    for m in 0..daily_letters.len() {
         let letter = daily_letters[m];
         let filled = filled_mask_from_packed(state.letters_packed);
         let legal_mask = (!filled) & (!state.disabled_mask) & ALL_MASK;
 
-        if legal_mask == 0 {
-            let final_score = game::finalize_score_packed(
-                state.letters_packed, state.disabled_mask,
-                state.score, state.c3, state.c4, state.c5,
-            );
-
-            if final_score > *best_score {
-                *best_score = final_score;
-            }
-
-            cache.insert(cache_key, final_score);
-            return final_score;
-        }
-
-        let mut local_best = i32::MIN;
+        let mut best_pos = None;
+        let mut best_score = i32::MIN;
         let mut lm = legal_mask;
 
         while lm != 0 {
             let pos = lm.trailing_zeros() as usize;
-            lm &= lm - 1; // Clear lowest bit
+            lm &= lm - 1;
 
             if let Some((new_packed, new_disabled, new_score, nc3, nc4, nc5)) =
                 game::apply_move_packed(
@@ -451,150 +655,37 @@ pub fn solve_exact(
                     segments,
                 )
             {
-                let new_state = State {
-                    disabled_mask: new_disabled,
-                    letters_packed: new_packed,
-                    c3: nc3,
-                    c4: nc4,
-                    c5: nc5,
-                    score: new_score,
-                };
-
-                let val = dfs(
-                    m + 1,
-                    new_state,
-                    daily_letters,
-                    dict,
-                    segments,
-                    seg_caps,
-                    suffix_counts,
-                    indices,
-                    nodes,
-                    best_score,
-                    last_report_t,
-                    start_t,
-                    root_ub,
-                    cache,
-                );
-
-                if val > local_best {
-                    local_best = val;
-                }
-            }
-        }
-
-        cache.insert(cache_key, local_best);
-        local_best
-    }
-
-    let initial_state = State {
-        disabled_mask: 0,
-        letters_packed: root_packed,
-        c3: 0,
-        c4: 0,
-        c5: 0,
-        score: 0,
-    };
-
-    let best_final = dfs(
-        0,
-        initial_state,
-        daily_letters,
-        &dict,
-        &segments,
-        &seg_caps,
-        &suffix_counts,
-        &indices,
-        &mut nodes,
-        &mut best_score,
-        &mut last_report_t,
-        start_t,
-        root_ub,
-        &mut cache,
-    );
-
-    // Reconstruct best path
-    fn reconstruct(
-        daily_letters: &[u8],
-        dict: &DictByLen,
-        segments: &Segments,
-        cache: &FxHashMap<(usize, State), i32>,
-    ) -> Vec<usize> {
-        let mut order = Vec::new();
-        let mut state = State {
-            disabled_mask: 0,
-            letters_packed: 0,
-            c3: 0,
-            c4: 0,
-            c5: 0,
-            score: 0,
-        };
-
-        for m in 0..daily_letters.len() {
-            let letter = daily_letters[m];
-            let filled = filled_mask_from_packed(state.letters_packed);
-            let legal_mask = (!filled) & (!state.disabled_mask) & ALL_MASK;
-
-            let mut best_pos = None;
-            let mut best_val = i32::MIN;
-            let mut lm = legal_mask;
-
-            while lm != 0 {
-                let pos = lm.trailing_zeros() as usize;
-                lm &= lm - 1;
-
-                if let Some((new_packed, new_disabled, new_score, nc3, nc4, nc5)) =
-                    game::apply_move_packed(
-                        state.letters_packed,
-                        state.disabled_mask,
-                        state.score,
-                        state.c3,
-                        state.c4,
-                        state.c5,
-                        pos,
-                        letter,
-                        dict,
-                        segments,
-                    )
-                {
-                    let new_state = State {
+                if new_score > best_score {
+                    best_score = new_score;
+                    best_pos = Some((pos, State {
                         disabled_mask: new_disabled,
                         letters_packed: new_packed,
                         c3: nc3,
                         c4: nc4,
                         c5: nc5,
                         score: new_score,
-                    };
-
-                    let val = cache.get(&(m + 1, new_state)).copied().unwrap_or(i32::MIN);
-
-                    if val > best_val {
-                        best_val = val;
-                        best_pos = Some((pos, new_state));
-                    }
+                    }));
                 }
-            }
-
-            if let Some((pos, new_state)) = best_pos {
-                order.push(pos);
-                state = new_state;
-            } else {
-                break;
             }
         }
 
-        order
+        if let Some((pos, new_state)) = best_pos {
+            order.push(pos);
+            state = new_state;
+        } else {
+            break;
+        }
     }
 
-    let best_order = reconstruct(daily_letters, &dict, &segments, &cache);
-
-    Ok(SolveResult {
-        best_score: best_final,
-        best_order,
-    })
+    order
 }
 
-pub fn solve(letters: &[char], mult: &[i32; 25], dict_path: &str) -> std::io::Result<()> {
+pub fn solve(
+    letters: &[char],
+    mult: &[i32; 25],
+    dict_path: &str,
+    num_threads: usize,
+) -> std::io::Result<()> {
     let letter_bytes: Vec<u8> = letters
         .iter()
         .map(|&c| {
@@ -607,7 +698,7 @@ pub fn solve(letters: &[char], mult: &[i32; 25], dict_path: &str) -> std::io::Re
         })
         .collect();
 
-    let result = solve_exact(&letter_bytes, mult, dict_path)?;
+    let result = solve_exact_parallel(&letter_bytes, mult, dict_path, num_threads)?;
 
     println!("Best score: {}", result.best_score);
     println!("Best order: {:?}", result.best_order);

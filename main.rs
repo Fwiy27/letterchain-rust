@@ -11,7 +11,7 @@ fn main() -> std::io::Result<()> {
     mult[17] = 2;
     mult[9] = 3;
 
-    solver::solve(&daily_letters, &mult, "dictionary.txt")?;
+    solver::solve(&daily_letters, &mult, "dictionary.txt", 10)?;
 
     Ok(())
 }
